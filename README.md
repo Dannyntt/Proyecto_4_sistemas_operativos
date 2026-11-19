@@ -61,21 +61,19 @@ Sistemas Operativos
 
 # Respuestas a las preguntas
 
-> Los valores de PTE de la pregunta 1 son los de la salida de ejemplo del docente; 
-
 ## 1. PTE antes y después de una escritura CoW
 
-Primera página de la tabla: dirección virtual `0x6000`.
+Primera página de la tabla: dirección virtual `0x5000` (`mapa: tabla en 0x5000`, salida de `minidb mapa` en `pruebas/minidb.txt`).
 
-- **Antes** (hijo, sin escribir): `pte 0x21fd11d3`, `pa 0x87f44000`. Los 10 bits bajos son `0x1d3 = 01 1101 0011`:
+- **Antes** (hijo, sin escribir): `pte 0x21fb61d3`, `pa 0x87ed8000`. Los 10 bits bajos son `0x1d3 = 01 1101 0011`:
   - V = 1, R = 1, **W = 0**, X = 0, U = 1, A = 1, D = 1, **COW = 1**.
   - Es una página de datos, legible, accesible desde usuario, sin permiso de escritura y marcada como CoW. Apunta a la misma página física que usa el padre.
-- **Después** (el hijo escribió): `pte 0x21fb28d7`, `pa 0x87eca000`. Bits bajos `0x0d7 = 00 1101 0111`:
+- **Después** (el hijo escribió): `pte 0x21fca0d7`, `pa 0x87f28000`. Bits bajos `0x0d7 = 00 1101 0111`:
   - V = 1, R = 1, **W = 1**, X = 0, U = 1, A = 1, D = 1, **COW = 0**.
 
 La dirección física cambió porque la escritura sobre una página sin `PTE_W` provocó el fault. Como el contador de la página valía 2 (padre e hijo), `cowfault()` pidió una página nueva con `kalloc()`, copió los 4096 bytes, puso en la PTE del hijo la dirección nueva con `PTE_W` y sin `PTE_COW`, y llamó a `kfree()` sobre la página vieja, cuyo contador bajó a 1. Así el hijo escribe en una copia privada y no altera lo que ve el padre.
 
-**El padre:** su PTE no cambia en ese momento. Sigue apuntando a `0x87f44000`, sin `W` y con `COW`. La diferencia es que ahora el contador de esa página es 1. Cuando el padre escriba, tendrá su fault, `cowfault()` verá `krefcount == 1` y no copiará nada: solo le devuelve `PTE_W` y quita `PTE_COW`, conservando la misma dirección física.
+**El padre:** su PTE no cambia en ese momento. Sigue apuntando a `0x87ed8000`, sin `W` y con `COW`. La diferencia es que ahora el contador de esa página es 1. Cuando el padre escriba, tendrá su fault, `cowfault()` verá `krefcount == 1` y no copiará nada: solo le devuelve `PTE_W` y quita `PTE_COW`, conservando la misma dirección física.
 
 ## 2. Páginas sin PTE_W y USYSCALL en fork()
 
@@ -98,30 +96,43 @@ Con `refs.lock`, cada lectura-modificación-escritura es atómica y la decisión
 ## 4. Consistencia del snapshot
 
 - **Checksum de antes del `fork()`:** después del `fork()` la tabla es compartida y de solo lectura (CoW). Cuando el padre modifica una página, el fault le da al **padre** una copia privada y el hijo conserva la página original, sin cambios. El hijo escribe `snap.db` leyendo sus propias páginas, que para él son una foto exacta del instante del `fork()`. Las escrituras del padre nunca llegan a esas páginas.
-- **`copias_cow` < 64:** la tabla ocupa 64 páginas (262144 bytes). Con 2000 transferencias, solo se tocaron unas 30 páginas distintas (`paginas_tocadas`; confirmen el número en su corrida), y solo esas se copian: CoW copia por demanda, solo lo que se escribe. Un `fork()` clásico habría copiado las 64 siempre, aunque M fuera 0 (con `snapshot 0`, `copias_cow=0`).
+- **`copias_cow` < 64:** la tabla ocupa 64 páginas (262144 bytes). Con 2000 transferencias, solo se tocaron 30 páginas distintas (`paginas_tocadas=30`, `copias_cow=30` en la corrida), y solo esas se copian: CoW copia por demanda, solo lo que se escribe. Un `fork()` clásico habría copiado las 64 siempre, aunque M fuera 0 (con `snapshot 0`, `copias_cow=0`).
 - **Si el padre esperara al hijo antes de transferir:** cuando el hijo ya terminó, su `exit()` liberó sus referencias y el contador de cada página vuelve a 1. Cada fault del padre vería `krefcount == 1` y solo reactivaría `PTE_W` sin copiar nada: `copias_cow` sería 0 (aunque `fallos_cow` seguiría igual). Además, el snapshot ya estaría terminado, así que no habría concurrencia: se pierde el punto del ejemplo.
 
 ## 5. Aceleración y planificador
 
+Ticks medidos de `minidb consulta K` con `CPUS=3` (`pruebas/minidb.txt`). Las celdas vacías son las que se miden a mano con `make qemu CPUS=1` y con `K=4`.
+
 | K | ticks `CPUS=1` | ticks `CPUS=3` |
 |---|---|---|
-| 1 | | |
-| 2 | | |
-| 3 | | |
+| 1 | | 46 |
+| 2 | | 22 |
+| 3 | | 14 |
 | 4 | | |
-| 8 | | |
+| 8 | | 17 |
+
+Aceleración con 3 trabajadores respecto a 1: 46 / 14 = 3,29x.
 
 - **De 1 a 3 trabajadores con `CPUS=3`:** cada trabajador es un proceso distinto con un tercio de las cuentas. El planificador de xv6 recorre la tabla de procesos desde cada hart y toma cualquier proceso `RUNNABLE`, así que los tres trabajadores se reparten en las tres CPUs y corren en paralelo. Con CoW no se copió la tabla al hacer `fork()`, y los trabajadores solo la leen, de modo que no hay faults ni contención: el tiempo baja casi a 1/K.
-- **De 3 a 8:** solo hay 3 CPUs. Los 8 procesos tienen que turnarse con Round Robin (cada uno recibe un quantum por cada timer interrupt, y el planificador pasa al siguiente `RUNNABLE`). El trabajo total es el mismo, y el tiempo total sigue siendo (trabajo total)/(3 CPUs); crear más procesos solo añade `fork()` y cambios de contexto.
+- **De 3 a 8** (14 ticks con 3, 17 con 8): solo hay 3 CPUs. Los 8 procesos tienen que turnarse con Round Robin (cada uno recibe un quantum por cada timer interrupt, y el planificador pasa al siguiente `RUNNABLE`). El trabajo total es el mismo, y el tiempo total sigue siendo (trabajo total)/(3 CPUs); crear más procesos solo añade `fork()` y cambios de contexto.
 - **`CPUS=1`:** hay un solo hart. Aunque haya K procesos, solo uno corre a la vez, y Round Robin los intercala. El trabajo total no se reduce y se suma el costo de los cambios de contexto y de crear procesos, así que los ticks son iguales o algo peores que con K=1.
 
 ---
 
 # Resultados de las pruebas
 
+Corridas con `python3 ejecutar_pruebas.py` sobre la versión entregada (3 CPUs en QEMU). La salida completa está en `pruebas/`.
 
 | Suite | Resultado |
 |---|---|
+| `cowtest` | PASÓ: `TODAS LAS PRUEBAS PASARON (11 de 11)` |
+| `minidb` | PASÓ: consultas con 1, 2, 3 y 8 trabajadores en `OK`; `snapshot 2000` (1978 aplicadas, 22 rechazadas, `paginas_tocadas=30`, `copias_cow=30`) y `snapshot 0` (`copias_cow=0`) en `OK`; revisión del script: OK |
+| `pgtbltest` | PASÓ: `TODAS LAS PRUEBAS PASARON (11 de 11)` |
+| `usertests -q` | PASÓ: `ALL TESTS PASSED` |
+
+Memoria en la consulta (`paginas_libres`, antes = 32433): con 1 trabajador 32424, con 2 → 32415, con 3 → 32406 y con 8 → 32361. Cada trabajador consume solo 9 páginas (tablas de páginas, trapframe, `USYSCALL`, pila), sin copiar las 64 de la tabla.
+
+---|---|
 | `cowtest` | (11 de 11) |
 | `minidb` | |
 | `pgtbltest` | |
