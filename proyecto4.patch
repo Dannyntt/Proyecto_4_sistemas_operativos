@@ -1,0 +1,670 @@
+diff --git a/Makefile b/Makefile
+index af1e7a5..44d3eb2 100644
+--- a/Makefile
++++ b/Makefile
+@@ -150,6 +150,9 @@ UPROGS=\
+ 	$U/_forphan\
+ 	$U/_dorphan\
+ 	$U/_sync\
++	$U/_pgtbltest\
++	$U/_cowtest\
++	$U/_minidb\
+ 
+ fs.img: mkfs/mkfs README $(UPROGS)
+ 	mkfs/mkfs fs.img README $(UPROGS)
+diff --git a/kernel/cowstat.h b/kernel/cowstat.h
+new file mode 100644
+index 0000000..9029d72
+--- /dev/null
++++ b/kernel/cowstat.h
+@@ -0,0 +1,12 @@
++#ifndef COWSTAT_H
++#define COWSTAT_H
++
++// Estadísticas de memoria y de Copy-on-Write que devuelve cowstat().
++struct cowstat {
++  uint64 freepages;   // páginas físicas libres en todo el sistema
++  uint64 sharedpages; // páginas físicas con más de una referencia
++  uint64 cowfaults;   // fallos CoW atendidos para el proceso que llama
++  uint64 cowcopies;   // de esos fallos, cuántos copiaron la página
++};
++
++#endif
+diff --git a/kernel/defs.h b/kernel/defs.h
+index 655ec05..ce093e3 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -59,6 +59,10 @@ void            ireclaim(int);
+ // kalloc.c
+ void*           kalloc(void);
+ void            kfree(void *);
++void            krefinc(void *);
++int             krefcount(void *);
++uint64          kfreepages(void);
++uint64          ksharedpages(void);
+ void            kinit(void);
+ 
+ // log.c
+@@ -164,6 +168,7 @@ void            uvmfree(pagetable_t, uint64);
+ void            uvmunmap(pagetable_t, uint64, uint64, int);
+ void            uvmclear(pagetable_t, uint64);
+ void            vmprint(pagetable_t);
++int             cowfault(pagetable_t, uint64);
+ pte_t *         walk(pagetable_t, uint64, int);
+ uint64          walkaddr(pagetable_t, uint64);
+ int             copyout(pagetable_t, uint64, uint64, char *, uint64);
+diff --git a/kernel/kalloc.c b/kernel/kalloc.c
+index 2fcec38..6de93ed 100644
+--- a/kernel/kalloc.c
++++ b/kernel/kalloc.c
+@@ -21,12 +21,25 @@ struct run {
+ struct {
+   struct spinlock lock;
+   struct run *freelist;
++  uint64 nfree; // páginas en freelist; también se protege con lock
+ } kmem;
+ 
++// Conteo de referencias por página física, desde KERNBASE hasta PHYSTOP.
++// Una página con conteo 0 está en la lista libre. Este lock protege solo el
++// arreglo; nunca se toma kmem.lock mientras se tiene este (ni al revés), así
++// que no hay orden de locks que respetar ni deadlock posible entre ambos.
++struct {
++  struct spinlock lock;
++  int count[(PHYSTOP - KERNBASE) / PGSIZE];
++} refs;
++
++#define PAGEIDX(pa) (((uint64)(pa) - KERNBASE) / PGSIZE)
++
+ void
+ kinit()
+ {
+   initlock(&kmem.lock, "kmem");
++  initlock(&refs.lock, "refs");
+   freerange(end, (void *)PHYSTOP);
+ }
+ 
+@@ -35,14 +48,18 @@ freerange(void *pa_start, void *pa_end)
+ {
+   char *p;
+   p = (char *)PGROUNDUP((uint64)pa_start);
+-  for (; p + PGSIZE <= (char *)pa_end; p += PGSIZE)
++  for (; p + PGSIZE <= (char *)pa_end; p += PGSIZE) {
++    // estas páginas nunca pasaron por kalloc(): se les da la referencia
++    // que kfree() va a quitar.
++    refs.count[PAGEIDX(p)] = 1;
+     kfree(p);
++  }
+ }
+ 
+-// Free the page of physical memory pointed at by pa,
+-// which normally should have been returned by a
+-// call to kalloc().  (The exception is when
+-// initializing the allocator; see kinit above.)
++// Quita una referencia a la página de memoria física pa. Solo cuando
++// no quedan referencias la devuelve a la lista libre.
++// (Al inicializar el allocator, freerange() llama a kfree() sobre páginas
++// que nunca pasaron por kalloc(); ver kinit más arriba.)
+ void
+ kfree(void *pa)
+ {
+@@ -51,6 +68,15 @@ kfree(void *pa)
+   if (((uint64)pa % PGSIZE) != 0 || (char *)pa < end || (uint64)pa >= PHYSTOP)
+     panic("kfree");
+ 
++  acquire(&refs.lock);
++  if (refs.count[PAGEIDX(pa)] < 1)
++    panic("kfree: conteo de referencias");
++  if (--refs.count[PAGEIDX(pa)] > 0) {
++    release(&refs.lock);
++    return; // otro proceso todavía la usa
++  }
++  release(&refs.lock);
++
+   // Fill with junk to catch dangling refs.
+   memset(pa, 1, PGSIZE);
+ 
+@@ -59,9 +85,62 @@ kfree(void *pa)
+   acquire(&kmem.lock);
+   r->next = kmem.freelist;
+   kmem.freelist = r;
++  kmem.nfree++;
+   release(&kmem.lock);
+ }
+ 
++// Agrega una referencia a una página que ya está en uso.
++void
++krefinc(void *pa)
++{
++  if (((uint64)pa % PGSIZE) != 0 || (char *)pa < end || (uint64)pa >= PHYSTOP)
++    panic("krefinc");
++
++  acquire(&refs.lock);
++  if (refs.count[PAGEIDX(pa)] < 1)
++    panic("krefinc: página libre");
++  refs.count[PAGEIDX(pa)]++;
++  release(&refs.lock);
++}
++
++// Número de referencias a la página pa.
++int
++krefcount(void *pa)
++{
++  int n;
++
++  acquire(&refs.lock);
++  n = refs.count[PAGEIDX(pa)];
++  release(&refs.lock);
++  return n;
++}
++
++// Páginas físicas libres en todo el sistema.
++uint64
++kfreepages(void)
++{
++  uint64 n;
++
++  acquire(&kmem.lock);
++  n = kmem.nfree;
++  release(&kmem.lock);
++  return n;
++}
++
++// Páginas físicas con más de una referencia.
++uint64
++ksharedpages(void)
++{
++  uint64 n = 0;
++
++  acquire(&refs.lock);
++  for (int i = 0; i < (PHYSTOP - KERNBASE) / PGSIZE; i++)
++    if (refs.count[i] > 1)
++      n++;
++  release(&refs.lock);
++  return n;
++}
++
+ // Allocate one 4096-byte page of physical memory.
+ // Returns a pointer that the kernel can use.
+ // Returns 0 if the memory cannot be allocated.
+@@ -72,11 +151,18 @@ kalloc(void)
+ 
+   acquire(&kmem.lock);
+   r = kmem.freelist;
+-  if (r)
++  if (r) {
+     kmem.freelist = r->next;
++    kmem.nfree--;
++  }
+   release(&kmem.lock);
+ 
+-  if (r)
++  if (r) {
++    // la página salió de la lista libre: nadie más la referencia todavía.
++    acquire(&refs.lock);
++    refs.count[PAGEIDX(r)] = 1;
++    release(&refs.lock);
+     memset((char *)r, 5, PGSIZE); // fill with junk
++  }
+   return (void *)r;
+ }
+diff --git a/kernel/proc.c b/kernel/proc.c
+index 97c2bff..808b39c 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -139,6 +139,8 @@ found:
+     return 0;
+   }
+   p->usyscall->pid = p->pid;
++  p->cowfaults = 0;
++  p->cowcopies = 0;
+ 
+   // An empty user page table.
+   p->pagetable = proc_pagetable(p);
+diff --git a/kernel/proc.h b/kernel/proc.h
+index a847366..e6dbdfd 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -98,6 +98,8 @@ struct proc {
+   pagetable_t pagetable;       // User page table
+   struct trapframe *trapframe; // data page for trampoline.S
+   struct usyscall *usyscall;   // read-only page shared with user
++  uint64 cowfaults;            // fallos CoW atendidos para este proceso
++  uint64 cowcopies;            // de esos fallos, los que copiaron la página
+   struct context context;      // swtch() here to run process
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
+diff --git a/kernel/riscv.h b/kernel/riscv.h
+index 8f72b79..bce1a18 100644
+--- a/kernel/riscv.h
++++ b/kernel/riscv.h
+@@ -398,6 +398,7 @@ typedef uint64 *pagetable_t; // 512 PTEs
+ #define PTE_X (1L << 3)
+ #define PTE_U (1L << 4) // user can access
+ #define PTE_A (1L << 6) // accessed
++#define PTE_COW (1L << 8) // copy-on-write: página compartida, antes escribible (bit RSW)
+ 
+ // shift a physical address to the right place for a PTE.
+ #define PA2PTE(pa) ((((uint64)pa) >> 12) << 10)
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index ba40af6..05711d0 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -105,6 +105,7 @@ extern uint64 sys_close(void);
+ extern uint64 sys_sync(void);
+ extern uint64 sys_vmprint(void);
+ extern uint64 sys_pgaccess(void);
++extern uint64 sys_cowstat(void);
+ 
+ // An array mapping syscall numbers from syscall.h
+ // to the function that handles the system call.
+@@ -134,6 +135,7 @@ static uint64 (*syscalls[])(void) = {
+   [SYS_sync]    = sys_sync,
+   [SYS_vmprint] = sys_vmprint,
+   [SYS_pgaccess] = sys_pgaccess,
++  [SYS_cowstat] = sys_cowstat,
+   // clang-format on
+ };
+ 
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index c8839e2..7cf5437 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -23,3 +23,4 @@
+ #define SYS_sync   22
+ #define SYS_vmprint 23
+ #define SYS_pgaccess 24
++#define SYS_cowstat 25
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index 5cd247f..9e9aab5 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -6,6 +6,7 @@
+ #include "spinlock.h"
+ #include "proc.h"
+ #include "vm.h"
++#include "cowstat.h"
+ 
+ uint64
+ sys_exit(void)
+@@ -136,6 +137,23 @@ sys_pgaccess(void)
+   return 0;
+ }
+ 
++uint64
++sys_cowstat(void)
++{
++  uint64 addr;
++  struct cowstat st;
++  struct proc *p = myproc();
++
++  argaddr(0, &addr);
++  st.freepages = kfreepages();
++  st.sharedpages = ksharedpages();
++  st.cowfaults = p->cowfaults;
++  st.cowcopies = p->cowcopies;
++  if (copyout(p->pagetable, p->sz, addr, (char *)&st, sizeof(st)) < 0)
++    return -1;
++  return 0;
++}
++
+ uint64
+ sys_uptime(void)
+ {
+diff --git a/kernel/trap.c b/kernel/trap.c
+index 00e99bc..4877a93 100644
+--- a/kernel/trap.c
++++ b/kernel/trap.c
+@@ -68,6 +68,8 @@ usertrap(void)
+     syscall();
+   } else if ((which_dev = devintr()) != 0) {
+     // ok
++  } else if (r_scause() == 15 && cowfault(p->pagetable, r_stval()) == 0) {
++    // page fault de escritura en una página copy-on-write
+   } else if ((r_scause() == 15 || r_scause() == 13) &&
+              vmfault(p->pagetable, p->sz, r_stval(),
+                      (r_scause() == 13) ? 1 : 0) != 0) {
+diff --git a/kernel/vm.c b/kernel/vm.c
+index 747c0c4..06c1678 100644
+--- a/kernel/vm.c
++++ b/kernel/vm.c
+@@ -314,10 +314,12 @@ uvmfree(pagetable_t pagetable, uint64 sz)
+   freewalk(pagetable);
+ }
+ 
+-// Given a parent process's page table, copy
+-// its memory into a child's page table.
+-// Copies both the page table and the
+-// physical memory.
++// Given a parent process's page table, share its memory with a
++// child's page table (copy-on-write).
++// No se copian páginas: el hijo mapea las mismas páginas físicas.
++// Las escribibles pasan a solo lectura con PTE_COW, en el padre y en el
++// hijo; la copia real ocurre en cowfault() cuando alguno escribe.
++// Las que ya eran de solo lectura (código) se comparten sin PTE_COW.
+ // returns 0 on success, -1 on failure.
+ // frees any allocated pages on failure.
+ int
+@@ -326,20 +328,21 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
+   pte_t *pte;
+   uint64 pa, i;
+   uint flags;
+-  char *mem;
+ 
+   for (i = 0; i < sz; i += PGSIZE) {
+     if ((pte = walk(old, i, 0)) == 0)
+       continue; // page table entry hasn't been allocated
+     if ((*pte & PTE_V) == 0)
+       continue; // physical page hasn't been allocated
++    // Solo las páginas de datos del usuario (W y U) pasan a CoW. La página de
++    // guarda de la pila conserva PTE_W pero no tiene PTE_U: no se toca.
++    if ((*pte & PTE_W) && (*pte & PTE_U))
++      *pte = (*pte & ~PTE_W) | PTE_COW;
+     pa = PTE2PA(*pte);
+     flags = PTE_FLAGS(*pte);
+-    if ((mem = kalloc()) == 0)
+-      goto err;
+-    memmove(mem, (char *)pa, PGSIZE);
+-    if (mappages(new, i, PGSIZE, (uint64)mem, flags) != 0) {
+-      kfree(mem);
++    krefinc((void *)pa);
++    if (mappages(new, i, PGSIZE, pa, flags) != 0) {
++      kfree((void *)pa); // deshace la referencia de esta página
+       goto err;
+     }
+   }
+@@ -350,6 +353,49 @@ err:
+   return -1;
+ }
+ 
++// Atiende un fallo de escritura en la página de va si es copy-on-write.
++// Si la página tiene más de una referencia, el proceso recibe una copia
++// propia; si es la única referencia, solo recupera el permiso de escritura.
++// Devuelve 0 si resolvió el fallo, -1 si la página no es CoW o si no hay
++// memoria para la copia (en ese caso el llamador mata al proceso).
++int
++cowfault(pagetable_t pagetable, uint64 va)
++{
++  pte_t *pte;
++  uint64 pa;
++  uint flags;
++  char *mem;
++  struct proc *p = myproc();
++
++  if (va >= MAXVA)
++    return -1;
++  va = PGROUNDDOWN(va);
++  pte = walk(pagetable, va, 0);
++  if (pte == 0 || (*pte & PTE_V) == 0 || (*pte & PTE_U) == 0 ||
++      (*pte & PTE_COW) == 0)
++    return -1;
++
++  pa = PTE2PA(*pte);
++  flags = (PTE_FLAGS(*pte) | PTE_W) & ~PTE_COW;
++  p->cowfaults++;
++
++  // Con una sola referencia nadie más puede subir el conteo (solo este
++  // proceso apunta a la página), así que no hace falta copiar. Si otro
++  // proceso baja el conteo justo ahora, lo peor es una copia de más.
++  if (krefcount((void *)pa) == 1) {
++    *pte = PA2PTE(pa) | flags;
++    return 0;
++  }
++
++  if ((mem = kalloc()) == 0)
++    return -1;
++  memmove(mem, (char *)pa, PGSIZE);
++  *pte = PA2PTE(mem) | flags;
++  kfree((void *)pa); // quita la referencia de este proceso a la página vieja
++  p->cowcopies++;
++  return 0;
++}
++
+ // mark a PTE invalid for user access.
+ // used by exec for the user stack guard page.
+ void
+@@ -385,6 +431,12 @@ copyout(pagetable_t pagetable, uint64 psz, uint64 dstva, char *src, uint64 len)
+     }
+ 
+     pte = walk(pagetable, va0, 0);
++    // la página puede ser copy-on-write: se copia antes de escribir.
++    if (*pte & PTE_COW) {
++      if (cowfault(pagetable, va0) < 0)
++        return -1;
++      pa0 = PTE2PA(*pte);
++    }
+     // forbid copyout over read-only user text pages.
+     if ((*pte & PTE_W) == 0)
+       return -1;
+diff --git a/user/minidb.c b/user/minidb.c
+index 56ac8c2..b4ff1f5 100644
+--- a/user/minidb.c
++++ b/user/minidb.c
+@@ -4,7 +4,7 @@
+ // ESQUELETO entregado por el docente. Ya están hechos:
+ //   minidb consulta K     reporte por sucursal con K procesos trabajadores
+ //   minidb mapa           vmprint() de un hijo antes y después de escribir
+-// El grupo debe implementar (busquen "TODO"):
++// Implementado por el grupo:
+ //   minidb snapshot M     guarda snap.db en un hijo mientras el padre
+ //                         aplica M transferencias (sección C.2 del enunciado)
+ //
+@@ -13,6 +13,7 @@
+ #include "kernel/types.h"
+ #include "kernel/riscv.h"
+ #include "kernel/fcntl.h"
++#include "kernel/stat.h"
+ #include "kernel/cowstat.h"
+ #include "user/user.h"
+ #include "user/minidb.h"
+@@ -168,38 +169,165 @@ consulta(int k)
+ }
+ 
+ 
+-// TODO (Parte C.2): el hijo escribe en SNAP_ARCHIVO un struct
+-// snap_encabezado (con el checksum calculado ANTES del fork) seguido de
+-// las NCUENTAS cuentas, escritas directamente desde la tabla (sin
+-// copiarlas a otro buffer). Termina con exit(0) si todo salió bien.
+-// (__attribute__((unused)) evita la advertencia mientras no se llame.)
+-static void __attribute__((unused))
++// Suma de los saldos de toda la tabla.
++static uint64
++saldo_total(void)
++{
++  uint64 total = 0;
++  for(int i = 0; i < NCUENTAS; i++)
++    total += tabla[i].saldo;
++  return total;
++}
++
++// Aplica una transferencia. La rechaza si origen y destino son la misma
++// cuenta o si el origen no tiene saldo suficiente. Devuelve 1 si la aplicó.
++static int
++transferir(struct transferencia *t)
++{
++  struct cuenta *o = &tabla[t->origen];
++  struct cuenta *d = &tabla[t->destino];
++
++  if(t->origen == t->destino || o->saldo < t->monto)
++    return 0;
++  o->saldo -= t->monto;
++  d->saldo += t->monto;
++  o->nmov++;
++  d->nmov++;
++  return 1;
++}
++
++// Cuenta los bits en 1 de una máscara de pgaccess().
++static int
++contar_bits(uint64 mascara)
++{
++  int n = 0;
++  for(; mascara; mascara >>= 1)
++    n += mascara & 1;
++  return n;
++}
++
++// Proceso hijo del snapshot: escribe en SNAP_ARCHIVO el encabezado (con el
++// checksum calculado antes del fork) y después las cuentas, directamente
++// desde la tabla. Gracias a copy-on-write el hijo ve la tabla tal como
++// estaba en el fork() aunque el padre la siga modificando.
++static void
+ guardar_snapshot(uint checksum)
+ {
+-  (void)checksum;
+-  exit(1);
++  struct snap_encabezado h;
++  int fd = open(SNAP_ARCHIVO, O_CREATE | O_WRONLY | O_TRUNC);
++
++  if(fd < 0)
++    exit(1);
++  h.magia = SNAP_MAGIA;
++  h.n = NCUENTAS;
++  h.checksum = checksum;
++  h.reservado = 0;
++  if(escribir_todo(fd, &h, sizeof(h)) < 0 ||
++     escribir_todo(fd, tabla, NCUENTAS * sizeof(struct cuenta)) < 0)
++    exit(1);
++  close(fd);
++  exit(0);
+ }
+ 
+-// TODO (Parte C.2): implementen el snapshot consistente.
+-//  1. Calcular checksum_tabla() y el saldo total; imprimir checksum_inicial.
+-//  2. Limpiar los bits PTE_A de la tabla con pgaccess() (64 páginas).
+-//  3. fork(): el hijo llama a guardar_snapshot(); el padre imprime la
+-//     línea "snapshot: hijo pid=..." y NO espera al hijo todavía.
+-//  4. El padre aplica m transferencias con generar_transferencia()
+-//     (semilla inicial 4), midiendo cowstat() antes y después.
+-//  5. pgaccess() para contar las páginas tocadas; imprimir las líneas
+-//     "transferencias=..." y "paginas_tocadas=...".
+-//  6. wait(), releer snap.db (usen sbrk() para el buffer: la pila es de
+-//     una sola página), verificar encabezado y checksum, verificar que el
+-//     saldo total se conservó e imprimir "snapshot: OK" o "snapshot: FALLO".
+-// El formato exacto de cada línea está en el Anexo B del enunciado.
++// Relee SNAP_ARCHIVO y verifica que sea la tabla tal como estaba en el
++// fork(). Imprime la línea "archivo" y devuelve 1 si todo coincide.
++static int
++verificar_archivo(uint checksum_inicial)
++{
++  struct snap_encabezado h;
++  struct stat st;
++  int ok = 1;
++  int fd = open(SNAP_ARCHIVO, O_RDONLY);
++
++  if(fd < 0 || fstat(fd, &st) < 0)
++    morir("no se pudo abrir snap.db");
++  // sbrk() y no una variable local: la pila es de una sola página.
++  struct cuenta *copia = (struct cuenta *)sbrk(NCUENTAS * sizeof(struct cuenta));
++  if(copia == (struct cuenta *)-1)
++    morir("no hay memoria para releer snap.db");
++
++  if(leer_todo(fd, &h, sizeof(h)) < 0 ||
++     leer_todo(fd, copia, NCUENTAS * sizeof(struct cuenta)) < 0)
++    ok = 0;
++  close(fd);
++
++  uint checksum_archivo = ok ? checksum_tabla(copia, NCUENTAS) : 0;
++  if(ok && (h.magia != SNAP_MAGIA || h.n != NCUENTAS || h.reservado != 0 ||
++            h.checksum != checksum_inicial ||
++            checksum_archivo != checksum_inicial))
++    ok = 0;
++  printf("snapshot: archivo bytes=%ld checksum=0x%x coincide=%s\n",
++         st.size, checksum_archivo, ok ? "si" : "no");
++  return ok;
++}
++
++// Snapshot consistente: un hijo guarda la tabla en disco mientras el padre
++// sigue aplicando m transferencias sobre la misma tabla.
+ static void
+ snapshot(int m)
+ {
+-  (void)m;
+   cargar_tabla();
+-  printf("snapshot: FALLO (sin implementar)\n");
+-  exit(1);
++
++  // 1. Estado de la tabla antes del fork.
++  uint checksum_inicial = checksum_tabla(tabla, NCUENTAS);
++  uint64 total_inicial = saldo_total();
++  printf("snapshot: checksum_inicial=0x%x\n", checksum_inicial);
++
++  // 2. Limpiar los bits de acceso para contar después solo lo que toque
++  //    el padre mientras el hijo escribe.
++  uint64 mascara;
++  if(pgaccess(tabla, 64, &mascara) < 0)
++    morir("pgaccess() falló");
++
++  // 3. El hijo comparte la tabla con el padre (copy-on-write).
++  int pid = fork();
++  if(pid < 0)
++    morir("fork() falló");
++  if(pid == 0)
++    guardar_snapshot(checksum_inicial);
++  printf("snapshot: hijo pid=%d escribiendo snap.db\n", pid);
++
++  // 4. El padre no espera al hijo: sigue aplicando transferencias.
++  struct cowstat antes, despues;
++  if(cowstat(&antes) < 0)
++    morir("cowstat() falló");
++  uint semilla = 4;
++  int aplicadas = 0, rechazadas = 0;
++  for(int i = 0; i < m; i++){
++    struct transferencia t;
++    generar_transferencia(&semilla, &t);
++    if(transferir(&t))
++      aplicadas++;
++    else
++      rechazadas++;
++  }
++  if(cowstat(&despues) < 0)
++    morir("cowstat() falló");
++
++  // 5. Páginas de la tabla que tocó el padre (antes de leer la tabla otra vez).
++  if(pgaccess(tabla, 64, &mascara) < 0)
++    morir("pgaccess() falló");
++  printf("snapshot: transferencias=%d aplicadas=%d rechazadas=%d\n",
++         m, aplicadas, rechazadas);
++  printf("snapshot: paginas_tocadas=%d fallos_cow=%ld copias_cow=%ld\n",
++         contar_bits(mascara), despues.cowfaults - antes.cowfaults,
++         despues.cowcopies - antes.cowcopies);
++
++  // 6. Esperar al hijo y verificar el archivo y la tabla.
++  int estado;
++  int ok = wait(&estado) == pid && estado == 0;
++  if(!ok)
++    printf("snapshot: el hijo no terminó bien\n");
++  if(!verificar_archivo(checksum_inicial))
++    ok = 0;
++
++  int conservado = saldo_total() == total_inicial;
++  if(!conservado)
++    ok = 0;
++  printf("snapshot: checksum_actual=0x%x total_conservado=%s\n",
++         checksum_tabla(tabla, NCUENTAS), conservado ? "si" : "no");
++  printf("snapshot: %s\n", ok ? "OK" : "FALLO");
++  exit(ok ? 0 : 1);
+ }
+ 
+ static void
+diff --git a/user/user.h b/user/user.h
+index bec2507..82d2c0e 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -43,6 +43,8 @@ char *sbrklazy(int);
+ int ugetpid(void);
+ int vmprint(void);
+ int pgaccess(void *, int, uint64 *);
++struct cowstat;
++int cowstat(struct cowstat *);
+ 
+ // printf.c
+ void fprintf(int, const char *, ...) __attribute__((format(printf, 2, 3)));
+diff --git a/user/usys.pl b/user/usys.pl
+index b9cb666..41dd7b9 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -45,3 +45,4 @@ entry("uptime");
+ entry("sync");
+ entry("vmprint");
+ entry("pgaccess");
++entry("cowstat");
