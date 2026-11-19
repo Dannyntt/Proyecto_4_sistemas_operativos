@@ -4,8 +4,8 @@
 ### Integrantes
 
 - Daniela Giraldo Salas
-- 
-- 
+- Gisel Lorena Jaramillo
+- Matías Gil
 
 ### Curso
 
